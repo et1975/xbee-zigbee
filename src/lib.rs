@@ -1,33 +1,18 @@
-//! Currently only supports XBee S2C hardware running the 802.15.04 RF firmware
-
 #![no_std]
 
 #[macro_use]
 extern crate bitflags;
 extern crate embedded_hal;
+#[macro_use]
 extern crate nb;
+extern crate heapless;
 
-mod api_frame;
-
-use api_frame::{FramePacker, TxOptions, TxRequestIter};
+pub mod frame;
+pub mod serializer;
 
 use embedded_hal::blocking::delay::DelayMs;
 use embedded_hal::blocking::serial::Write as BlockingWrite;
-use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::serial::{Read, Write};
-use embedded_hal::spi::FullDuplex;
-
-const BROADCAST_ADDR: u16 = 0xFFFF;
-const COORDINATOR_ADDR: u16 = 0xFFFE;
-
-// TODO: builders
-
-// TODO: maybe add broadcast
-// TODO: maybe add coordinator
-pub enum Addr {
-    Short(u16),
-    Long(u64),
-}
 
 pub struct XBeeTransparent<'a, 'b, U: 'a, D: 'b> {
     serial: &'a mut U,
@@ -39,31 +24,12 @@ pub struct XBeeTransparent<'a, 'b, U: 'a, D: 'b> {
 trait XBeeApi {
     type Error;
 
-    fn send_data(&mut self, frame_id: u8, addr: Addr, data: &[u8]) -> Result<(), Self::Error>;
-    fn send_data_no_ack(&mut self, frame_id: u8, addr: Addr, data: &[u8]) -> Result<(), Self::Error>;
-    fn at_command(&mut self, frame_id: u8, at_cmd: [u8; 2], params: &[u8]);
-    fn at_queue_param(&mut self, frame_id: u8, at_cmd: [u8; 2], params: &[u8]);
-    fn remote_at_command(&mut self, frame_id: u8, addr: Addr, at_cmd: [u8; 2], params: &[u8]);
+    fn send(&mut self, &frame::Outbound) -> Result<(), Self::Error>;
+    fn receive(&mut self) -> Result<frame::Inbound, Self::Error>;
 }
 
 pub struct XBeeApiUart<'a, U: 'a> {
     serial: &'a mut U,
-}
-
-pub struct XBeeApiEscapedUart<'a, U: 'a> {
-    serial: &'a mut U,
-}
-
-pub struct XBeeApiSpi<'a, 'b, 'c, S: 'a, C: 'b, A: 'c> {
-    serial: &'a mut S,
-    cs: &'b mut C,
-    attn: &'c mut A,
-}
-
-pub struct XBeeApiEscapedSpi<'a, 'b, 'c, S: 'a, C: 'b, A: 'c> {
-    serial: &'a mut S,
-    cs: &'b mut C,
-    attn: &'c mut A,
 }
 
 impl<'a, 'b, E, U, D> XBeeTransparent<'a, 'b, U, D>
@@ -85,7 +51,6 @@ where
         }
     }
 
-    // TODO: maybe return result to show that the command has
     pub fn enter_command_mode(&mut self) -> Result<(), E> {
         // wait for guard time
         self.timer.delay_ms(self.guard_time);
@@ -167,78 +132,17 @@ where
     }
 }
 
-impl<'a, E, U> XBeeApi for XBeeApiUart<'a, U>
-where
-    U: Read<u8, Error = E> + BlockingWrite<u8, Error = E>,
-{
-    type Error = E;
+// impl<'a, E, U> XBeeApi for XBeeApiUart<'a, U>
+// where
+//     U: Read<u8, Error = E> + BlockingWrite<u8, Error = E> + Write<u8, Error = E>,
+// {
+//     type Error = serializer::SerializationError<E>;
 
-    fn send_data(&mut self, frame_id: u8, addr: Addr, data: &[u8]) -> Result<(), E> {
-        let tx_request = TxRequestIter::new(
-            frame_id,
-            addr,
-            TxOptions::empty(),
-            data.iter().map(|v| *v),
-        );
-        let frame = FramePacker::new(
-            tx_request,
-            false,
-            false,
-        ).expect("packing error"); // TODO:
+//     fn send(&mut self, frame : &frame::Outbound) -> Result<(), Self::Error> {
+//         serializer::serialize(&mut |b| self.serial.write(b), frame)?;
+//         Ok(())
+//     }
 
-        for byte in frame {
-            self.serial.bwrite_all(&[byte])?;
-        }
-        self.serial.bflush()
-    }
-
-    fn send_data_no_ack(&mut self, frame_id: u8, addr: Addr, data: &[u8]) -> Result<(), E> {
-        let tx_request = TxRequestIter::new(
-            frame_id,
-            addr,
-            TxOptions::DISABLE_ACK,
-            data.iter().map(|v| *v),
-        );
-        let frame = FramePacker::new(
-            tx_request,
-            false,
-            false,
-        ).expect("packing error"); // TODO:
-
-        for byte in frame {
-            self.serial.bwrite_all(&[byte])?;
-        }
-        self.serial.bflush()
-    }
-
-    fn at_command(&mut self, frame_id: u8, at_cmd: [u8; 2], params: &[u8]) {
-        unimplemented!()
-    }
-
-    fn at_queue_param(&mut self, frame_id: u8, at_cmd: [u8; 2], params: &[u8]) {
-        unimplemented!()
-    }
-
-    fn remote_at_command(&mut self, frame_id: u8, addr: Addr, at_cmd: [u8; 2], params: &[u8]) {
-        unimplemented!()
-    }
-}
-
-impl<'a, 'b, 'c, E, S, C, A> XBeeApiSpi<'a, 'b, 'c, S, C, A>
-where
-    S: FullDuplex<u8, Error = E>,
-    C: OutputPin,
-    A: InputPin,
-{
-    pub fn new_spi(
-        spi: &'a mut S,
-        cs: &'b mut C,
-        attn: &'c mut A,
-    ) -> XBeeApiSpi<'a, 'b, 'c, S, C, A> {
-        XBeeApiSpi {
-            serial: spi,
-            cs,
-            attn,
-        }
-    }
-}
+//     fn receive(&mut self) -> Result<frame::Inbound, E> {
+//     }
+// }

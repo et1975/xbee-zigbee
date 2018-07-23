@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "gdb",
+            "request": "attach",
+            "name": "Run main",
+            "gdbpath": "arm-none-eabi-gdb",
+            "executable": "./target/thumbv7em-none-eabihf/debug/examples/main",
+            "target": "| openocd -c \"gdb_port pipe; log_output tmp/openocd.log\" -f interface/stlink-v2-1.cfg -f target/stm32f3x.cfg",
+            "remote": true,
+            "cwd": "${workspaceRoot}",
+            "autorun": [
+                "monitor reset halt",
+                "monitor tpiu config internal tmp/itm.log uart off 8000000",
+                "monitor itm port 0 on",
+                "monitor arm semihosting enable",
+                "load",
+                "step"
+            ]
+        },
+        {
+            "type": "gdb",
+            "request": "attach",
+            "name": "Run rt",
+            "gdbpath": "arm-none-eabi-gdb",
+            "executable": "./target/thumbv7em-none-eabihf/debug/examples/rt",
+            "target": "| openocd -c \"gdb_port pipe; log_output tmp/openocd.log\" -f interface/stlink-v2-1.cfg -f target/stm32f3x.cfg",
+            "remote": true,
+            "cwd": "${workspaceRoot}",
+            "autorun": [
+                "monitor reset halt",
+                "monitor tpiu config internal tmp/itm.log uart off 8000000",
+                "monitor itm port 0 on",
+                "monitor arm semihosting enable",
+                "load",
+                "step"
+            ]
+        }
+    ]
+}
