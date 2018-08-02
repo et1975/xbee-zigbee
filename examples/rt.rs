@@ -12,21 +12,19 @@
 extern crate cortex_m;
 extern crate cortex_m_rt as rt;
 extern crate cortex_m_rtfm as rtfm;
-extern crate f3;
+extern crate stm32f30x_hal as hal;
 extern crate xbee_zigbee;
 extern crate byteorder;
 extern crate heapless;
 
 use cortex_m::peripheral::ITM;
-use f3::hal::prelude::*; 
-use f3::hal::serial::{Event, Rx, Serial, Tx};
-use f3::hal::stm32f30x::{self, USART2, TIM6};
-use f3::hal::timer::{self, Timer};
+use hal::prelude::*; 
+use hal::serial::{Event, Rx, Serial, Tx};
+use hal::stm32f30x::{self, USART2, TIM6};
+use hal::timer::{self, Timer};
 use rtfm::{app, Resource, Threshold};
 use xbee_zigbee::*;
 use byteorder::{ByteOrder, BE};
-use heapless::consts::*;
-use heapless::ring_buffer::{RingBuffer, Consumer, Producer};
 
 const INTERVAL:u32 = 10; // seconds
 
@@ -34,14 +32,12 @@ app! {
     device: stm32f30x,
 
     resources: {
-        static RB: RingBuffer<u8, U1024> = RingBuffer::new();
-        static RXP: Producer<'static, u8, [u8,U1024]>;
-        static RXC: Consumer<u8>;
+        static COUNTER: u32;
         static TX: Tx<USART2>;
         static RX: Rx<USART2>;
         static ITM: ITM;
         static TIMER: Timer<TIM6>;
-        static DTO: Option<u64>;
+        static DTO: Option<i64>;
         static TEMP: u16;
     },
 
@@ -49,12 +45,12 @@ app! {
         USART2_EXTI26: {
             path: receive,
             priority: 2,
-            resources: [RX, ITM, DTO, RXP],
+            resources: [RX, ITM, DTO],
         },
         TIM6_DACUNDER: {
             path: on_timer,
             priority: 1,
-            resources: [ITM, TIMER, TX, DTO, TEMP]
+            resources: [ITM, TIMER, TX, DTO, TEMP, COUNTER]
         }
     },
 
@@ -79,42 +75,24 @@ fn init(p: init::Peripherals) -> init::LateResources {
     let mut serial = Serial::usart2(
         p.device.USART2,
         (tx, rx),
-        115_200.bps(),
+        9600.bps(),
         clocks,
         &mut rcc.apb1,
     );
     serial.listen(Event::Rxne);
     let (tx, rx) = serial.split();
 
-    let mut timer = Timer::tim6(p.device.TIM6, INTERVAL.hz(), clocks, &mut rcc.apb1);
+    let mut timer = Timer::tim6(p.device.TIM6, 1.hz(), clocks, &mut rcc.apb1);
     timer.listen(timer::Event::TimeOut);
     iprintln!(&mut itm.stim[0], "Listening...");
     
-    init::LateResources { TX: tx, RX: rx,
+    init::LateResources { COUNTER: 0,
+        TX: tx, RX: rx,
         ITM: itm, TIMER: timer,
         DTO: None, TEMP: 0 }
 }
 
 fn idle(_t: &mut Threshold, mut _r: idle::Resources) -> ! {
-    let (mut rxc, mut itm, mut dto) = (r.RXC, r.ITM, r.DTO);
-    let mut pop = || {
-        match rxc.dequeue() {
-            | Some(x) -> Ok(x),
-            | _ -> Error(nb::WouldBlock)
-        }
-    }
-    let r = serializer::read(&mut || , &mut |res| {
-        match res {
-        | frame::Inbound::RxPacket { ref data, .. } => {
-            let x = BE::read_u64(&data[1..]); // Assume Data::PollCmd thunderdome packet
-            *dto = Some(x)
-          },
-        | other =>
-            iprintln!(&mut itm.stim[0], "Recived frame: {:?}", other),
-        }
-    });
-    iprintln!(&mut itm.stim[0], "Recived: {:?}", r)
-
     loop {
         rtfm::wfi();
     }
@@ -123,20 +101,24 @@ fn idle(_t: &mut Threshold, mut _r: idle::Resources) -> ! {
 fn on_timer(t: &mut Threshold, mut r: TIM6_DACUNDER::Resources) {
     // Clear flag to avoid getting stuck in interrupt
     r.TIMER.wait().unwrap();
-    let mut tx = r.TX;
-    
+    let (mut counter, mut tx) = (r.COUNTER, r.TX);
+    *counter += 1;
+
     r.TEMP.claim_mut(t, |temp, _t| *temp += 1);
     let mut local_dto = None;
-    r.DTO.claim(t, |dto, _t| local_dto = *dto);
+    r.DTO.claim_mut(t, |dto, _t| {
+        local_dto = *dto;
+        *dto = dto.map(|v| v+1000); // add 1s
+    });
 
-    match local_dto {
-    | Some(dto) => {
-        let mut data: [u8; 12] = [0,0,0,0,0,0,0,0,0,0,0,0];
+    match (*counter % INTERVAL, local_dto) {
+    | (0,Some(dto)) => {
+        let mut data: [u8; 11] = [0,0,0,0,0,0,0,0,0,0,0];
         data[0] = 0x1; // Data::TempReading thunderdome packet
-        BE::write_u64(&mut data[1..], dto);
-        BE::write_u16(&mut data[10..], *r.TEMP);
+        BE::write_i64(&mut data[1..], dto);
+        BE::write_u16(&mut data[9..], *r.TEMP);
         let mut frame = frame::Outbound::TxRequest {
-                frame_id: (*r.TEMP & 0xFF) as u8,
+                frame_id: (*counter & 0xFF) as u8,
                 dest_addr: frame::Address::COORDINATOR,
                 dest_mac: frame::MAC::COORDINATOR,
                 bc_radius: 0x01,
@@ -144,17 +126,27 @@ fn on_timer(t: &mut Threshold, mut r: TIM6_DACUNDER::Resources) {
                 data: &data
             };
         serializer::write(&mut |x| tx.write(x), &mut frame).unwrap();
-        r.ITM.claim_mut(t, |itm,_t| iprintln!(&mut itm.stim[0], "\nSent"));
-        
-        r.DTO.claim_mut(t, |global_dto, _t| *global_dto = Some(dto+(INTERVAL as u64)*1000)); // add 10s
+//        r.ITM.claim_mut(t, |itm,_t| iprintln!(&mut itm.stim[0], "Sent: {:?}", data));
     },
     | _ => ()
     }
 }
 
 fn receive(_t: &mut Threshold, r: USART2_EXTI26::Resources) {
-    let (mut rx, mut rxp) = (r.RX, r.RXP);
-    rxp.enqueue(block!(rx.read()).unwrap());
+    let (mut rx, mut itm, mut dto) = (r.RX, r.ITM, r.DTO);
+    if rx.has_data() {
+        serializer::read(&mut || rx.read(), &mut |res| {
+            match res {
+            | frame::Inbound::RxPacket { ref data, .. } => {
+                let x = BE::read_i64(&data[1..]); // Assume Data::PollCmd thunderdome packet
+                *dto = Some(x)
+            },
+            | _ => ()
+            }
+            iprintln!(&mut itm.stim[0], "Recived frame: {:?}", res)
+        }).unwrap();
+    }
+    rx.clear_overrun_error();
 }
 
 
